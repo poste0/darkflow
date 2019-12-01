@@ -8,6 +8,21 @@ from .framework import create_framework
 from ..dark.darknet import Darknet
 import json
 import os
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+import cv2
+import numpy as np
+class HostDeviceMem(object):
+    def __init__(self, host_mem, device_mem):
+        self.host = host_mem
+        self.device = device_mem
+
+    def __str__(self):
+        return "Host:\n" + str(self.host) + "\nDevice:\n" + str(self.device)
+
+    def __repr__(self):
+        return self.__str__()
 
 class TFNet(object):
 
@@ -44,6 +59,84 @@ class TFNet(object):
 			FLAGS = newFLAGS
 
 		self.FLAGS = FLAGS
+		if self.FLAGS.tensor:
+			with open(self.FLAGS.metaLoad, 'r') as fp:
+				self.meta = json.load(fp)
+			self.framework = create_framework(self.meta, self.FLAGS)
+			MODEL_FILE = '/home/sergey/darkflow/built_graph/tiny-yolo-voc.uff'
+			INPUT_NAME = "input"
+			INPUT_SHAPE = (3, 416,416)
+			OUTPUT_NAME = "BiasAdd_8"
+			TRT_LOGGER = trt.infer.ConsoleLogger(trt.infer.LogSeverity.ERROR)
+			from tensorrt.parsers import uffparser
+			#builder = trt.Builder(TRT_LOGGER)
+			#network = builder.create_network()
+			parser = uffparser.create_uff_parser()
+			parser.register_input("input", (3, 416,416), 0)
+			parser.register_output(OUTPUT_NAME)
+			#parser.parse(MODEL_FILE, network)
+			import uff
+			m = uff.from_tensorflow_frozen_model(MODEL_FILE, ["BiasAdd_8"])
+			engine = trt.utils.uff_to_trt_engine(TRT_LOGGER, m, parser,1,1<<20)
+			print(engine)
+			inputs = []
+			outputs = []
+			bindings = []
+			stream = cuda.Stream()
+			for binding in engine:
+				size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
+				dtype = trt.nptype(engine.get_binding_dtype(binding))
+				# Allocate host and device buffers
+				host_mem = cuda.pagelocked_empty(size, dtype)
+				device_mem = cuda.mem_alloc(host_mem.nbytes)
+				# Append the device buffer to device bindings.
+				bindings.append(int(device_mem))
+				# Append to the appropriate list.
+				if engine.binding_is_input(binding):
+					inputs.append(HostDeviceMem(host_mem, device_mem))
+				else:
+					outputs.append(HostDeviceMem(host_mem, device_mem))
+			context = engine.create_execution_context()
+			img = cv2.imread('/home/sergey/darkflow/sample_img/sample_computer.jpg')
+			img = self.framework.resize_input(img)
+			img = img.transpose(2, 0, 1)
+			h, w, _ = img.shape
+			img = img.ravel()
+			np.copyto(inputs[0].host,img)
+			[cuda.memcpy_htod_async(inp.device, inp.host, stream) for inp in inputs]
+			# Run inference.
+			context.execute_async(batch_size=1, bindings=bindings, stream_handle=stream.handle)
+			# Transfer predictions back from the GPU.
+			[cuda.memcpy_dtoh_async(out.host, out.device, stream) for out in outputs]
+			# Synchronize the stream
+			stream.synchronize()
+
+			[result] = [out.host for out in outputs]
+			print(result)
+
+			file = open('/home/sergey/q.txt' , 'w')
+			np.savetxt('/home/sergey/q.txt' , result.ravel())
+			out = np.ndarray(shape=(13,13,125) ,dtype=np.float32)
+			out = result.reshape((13,13,125))
+			boxes = self.framework.findboxes(out)
+			threshold = self.FLAGS.threshold
+			boxesInfo = list()
+			for box in boxes:
+				tmpBox = self.framework.process_box(box, h, w, threshold)
+				if tmpBox is None:
+					continue
+				boxesInfo.append({
+					"label": tmpBox[4],
+					"confidence": tmpBox[6],
+					"topleft": {
+						"x": tmpBox[0],
+						"y": tmpBox[2]},
+					"bottomright": {
+						"x": tmpBox[1],
+						"y": tmpBox[3]}
+				})
+			print(boxesInfo)
+			return
 		if self.FLAGS.pbLoad and self.FLAGS.metaLoad:
 			self.say('\nLoading from .pb and .meta')
 			self.graph = tf.Graph()
@@ -78,12 +171,20 @@ class TFNet(object):
 			time.time() - start))
 	
 	def build_from_pb(self):
+		graph_def = tf.GraphDef()
 		with tf.gfile.FastGFile(self.FLAGS.pbLoad, "rb") as f:
-			graph_def = tf.GraphDef()
 			graph_def.ParseFromString(f.read())
+		import tensorflow.contrib.tensorrt as t
+		graph_deff = t.create_inference_graph(
+			input_graph_def=graph_def,
+			outputs=['BiasAdd_22'],
+			max_batch_size=1,
+			max_workspace_size_bytes=512,
+			precision_mode='FP32')
+
 		
 		tf.import_graph_def(
-			graph_def,
+			graph_deff,
 			name=""
 		)
 		with open(self.FLAGS.metaLoad, 'r') as fp:
@@ -93,7 +194,7 @@ class TFNet(object):
 		# Placeholders
 		self.inp = tf.get_default_graph().get_tensor_by_name('input:0')
 		self.feed = dict() # other placeholders
-		self.out = tf.get_default_graph().get_tensor_by_name('output:0')
+		self.out = tf.get_default_graph().get_tensor_by_name('BiasAdd_22:0')
 		
 		self.setup_meta_ops()
 	

@@ -4,6 +4,20 @@ import numpy as np
 import tensorflow as tf
 import pickle
 from multiprocessing.pool import ThreadPool
+import tensorrt as trt
+import pycuda.driver as cuda
+import pycuda.autoinit
+import cv2
+class HostDeviceMem(object):
+    def __init__(self, host_mem, device_mem):
+        self.host = host_mem
+        self.device = device_mem
+
+    def __str__(self):
+        return "Host:\n" + str(self.host) + "\nDevice:\n" + str(self.device)
+
+    def __repr__(self):
+        return self.__str__()
 
 train_stats = (
     'Training statistics: \n'
@@ -81,7 +95,14 @@ def return_predict(self, im):
     this_inp = np.expand_dims(im, 0)
     feed_dict = {self.inp : this_inp}
 
+    img = cv2.imread('/home/sergey/darkflow/sample_img/sample_computer.jpg')
+    img = self.framework.resize_input(img)
+    h, w, _ = img.shape
+    import tensorflow.contrib.tensorrt as t
     out = self.sess.run(self.out, feed_dict)[0]
+    #print(out)
+    file = open('w.txt' , 'w')
+    np.savetxt('/home/sergey/w.txt' , out.ravel())
     boxes = self.framework.findboxes(out)
     threshold = self.FLAGS.threshold
     boxesInfo = list()
